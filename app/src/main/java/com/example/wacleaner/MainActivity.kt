@@ -3,15 +3,20 @@ package com.example.wacleaner
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ContentProviderOperation
 import android.content.ContentUris
 import android.content.ContentValues
+import android.content.Context
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Bundle
 import android.os.Environment
 import android.provider.ContactsContract
 import android.provider.MediaStore
+import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.LinearLayout
@@ -23,7 +28,22 @@ data class ContactItem(
     val id: Long,
     val lookupKey: String,
     val name: String,
-    val phone: String
+    val phone: String,
+    val accounts: String,
+    val starred: Boolean
+)
+
+class ScanResult(
+    val items: List<ContactItem> = emptyList(),
+    val total: Int = 0,
+    val waLinked: Int = 0,
+    val error: String? = null
+)
+
+class DeleteReport(
+    val deleted: List<ContactItem>,
+    val failed: List<Pair<ContactItem, String>>,
+    val cancelled: Boolean
 )
 
 class MainActivity : Activity() {
@@ -31,11 +51,17 @@ class MainActivity : Activity() {
     private val executor = Executors.newSingleThreadExecutor()
     private val items = mutableListOf<ContactItem>()
 
+    @Volatile
+    private var cancelled = false
+    private var busy = false
+    private var suspicious = false
+
     private lateinit var status: TextView
     private lateinit var list: ListView
     private lateinit var scanButton: Button
     private lateinit var selectAllButton: Button
     private lateinit var deleteButton: Button
+    private lateinit var cancelButton: Button
 
     private val waAccountTypes = arrayOf("com.whatsapp", "com.whatsapp.w4b")
 
@@ -43,6 +69,14 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         buildUi()
     }
+
+    override fun onDestroy() {
+        cancelled = true
+        executor.shutdown()
+        super.onDestroy()
+    }
+
+    // ---------- UI ----------
 
     private fun buildUi() {
         val pad = (16 * resources.displayMetrics.density).toInt()
@@ -52,12 +86,15 @@ class MainActivity : Activity() {
         }
 
         status = TextView(this).apply {
-            text = "Tekan \"Pindai kontak\" untuk mencari kontak yang tidak terhubung WhatsApp."
+            text = "Tekan \"Pindai kontak\" untuk mencari kontak yang tidak terhubung WhatsApp. " +
+                    "Pemindaian tidak mengubah apa pun."
             textSize = 15f
         }
         root.addView(status)
 
-        val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+
+        val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         scanButton = Button(this).apply {
             text = "Pindai kontak"
             setOnClickListener { ensurePermissionsThenScan() }
@@ -72,11 +109,20 @@ class MainActivity : Activity() {
             isEnabled = false
             setOnClickListener { confirmDelete() }
         }
-        val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        buttons.addView(scanButton, lp)
-        buttons.addView(selectAllButton, lp)
-        buttons.addView(deleteButton, lp)
-        root.addView(buttons)
+        row1.addView(scanButton, lp)
+        row1.addView(selectAllButton, lp)
+        row1.addView(deleteButton, lp)
+        root.addView(row1)
+
+        cancelButton = Button(this).apply {
+            text = "Batalkan penghapusan"
+            visibility = View.GONE
+            setOnClickListener {
+                cancelled = true
+                status.text = "Membatalkan setelah kelompok yang sedang berjalan selesai..."
+            }
+        }
+        root.addView(cancelButton)
 
         list = ListView(this).apply {
             choiceMode = ListView.CHOICE_MODE_MULTIPLE
@@ -84,19 +130,37 @@ class MainActivity : Activity() {
         }
         root.addView(
             list,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-            )
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         )
 
         setContentView(root)
     }
 
+    private fun ui(block: () -> Unit) {
+        runOnUiThread {
+            if (!isFinishing && !isDestroyed) block()
+        }
+    }
+
+    private fun setBusy(value: Boolean, deleting: Boolean = false) {
+        busy = value
+        scanButton.isEnabled = !value
+        selectAllButton.isEnabled = !value && items.isNotEmpty() && !suspicious
+        list.isEnabled = !value
+        cancelButton.visibility = if (value && deleting) View.VISIBLE else View.GONE
+        if (value) {
+            deleteButton.isEnabled = false
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            updateDeleteButton()
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
     // ---------- Izin ----------
 
     private fun ensurePermissionsThenScan() {
+        if (busy) return
         val needed = arrayOf(
             Manifest.permission.READ_CONTACTS,
             Manifest.permission.WRITE_CONTACTS
@@ -124,55 +188,83 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- Pemindaian ----------
+    // ---------- Pemindaian (hanya membaca) ----------
 
     private fun scan() {
+        if (busy) return
+        setBusy(true)
         status.text = "Memindai..."
-        scanButton.isEnabled = false
         executor.execute {
             val result = try {
                 doScan()
             } catch (e: Exception) {
                 ScanResult(error = "Gagal memindai: ${e.message}")
             }
-            runOnUiThread {
-                scanButton.isEnabled = true
+            ui {
                 if (result.error != null) {
-                    status.text = result.error
                     showItems(emptyList())
+                    setBusy(false)
+                    status.text = result.error
                 } else {
+                    suspicious = result.total > 20 && result.items.size * 10 > result.total * 9
                     showItems(result.items)
-                    status.text = "Ditemukan ${result.items.size} kontak tanpa WhatsApp " +
-                            "dari ${result.total} kontak. Centang yang ingin dihapus."
+                    setBusy(false)
+                    status.text = buildString {
+                        append("Dari ${result.total} kontak: ${result.waLinked} terhubung WhatsApp, ")
+                        append("${result.items.size} tidak terhubung.")
+                        if (suspicious) {
+                            append(
+                                "\nPERINGATAN: hampir semua kontak terdeteksi tidak terhubung. " +
+                                        "Kemungkinan sinkronisasi kontak WhatsApp belum selesai. " +
+                                        "\"Pilih semua\" dimatikan; periksa dulu dan centang satu per satu."
+                            )
+                        } else if (result.items.isNotEmpty()) {
+                            append(" Centang yang ingin dihapus.")
+                        }
+                    }
                 }
             }
         }
     }
 
-    private class ScanResult(
-        val items: List<ContactItem> = emptyList(),
-        val total: Int = 0,
-        val error: String? = null
-    )
+    private fun accountLabel(type: String?, name: String?): String {
+        val t = type ?: ""
+        return when {
+            t.isEmpty() -> "Lokal (HP)"
+            t == "com.google" -> if (name.isNullOrEmpty()) "Google" else "Google ($name)"
+            t in waAccountTypes -> "WhatsApp"
+            t.contains("sim", ignoreCase = true) -> "SIM"
+            else -> t.substringAfterLast('.')
+        }
+    }
 
     private fun doScan(): ScanResult {
-        // 1. Kumpulkan ID kontak yang punya entri WhatsApp.
+        // 1. Semua raw contact: tandai kontak yang punya entri WhatsApp, dan catat akunnya.
         val waContactIds = HashSet<Long>()
-        val placeholders = waAccountTypes.joinToString(",") { "?" }
+        val accounts = HashMap<Long, MutableSet<String>>()
         contentResolver.query(
             ContactsContract.RawContacts.CONTENT_URI,
-            arrayOf(ContactsContract.RawContacts.CONTACT_ID),
-            "${ContactsContract.RawContacts.ACCOUNT_TYPE} IN ($placeholders) " +
-                    "AND ${ContactsContract.RawContacts.DELETED} = 0",
-            waAccountTypes,
+            arrayOf(
+                ContactsContract.RawContacts.CONTACT_ID,
+                ContactsContract.RawContacts.ACCOUNT_TYPE,
+                ContactsContract.RawContacts.ACCOUNT_NAME
+            ),
+            "${ContactsContract.RawContacts.DELETED} = 0",
+            null,
             null
         )?.use { c ->
-            while (c.moveToNext()) waContactIds.add(c.getLong(0))
+            while (c.moveToNext()) {
+                val id = c.getLong(0)
+                val type = c.getString(1)
+                val accName = c.getString(2)
+                if (type != null && type in waAccountTypes) waContactIds.add(id)
+                accounts.getOrPut(id) { linkedSetOf() }.add(accountLabel(type, accName))
+            }
         }
 
         // Pengaman: jika tidak ada satu pun kontak WhatsApp, kemungkinan WhatsApp belum
         // terpasang atau sinkronisasi kontaknya mati. Jangan tampilkan semua kontak sebagai
-        // "tidak terhubung" karena itu bisa menyebabkan semua kontak terhapus.
+        // "tidak terhubung".
         if (waContactIds.isEmpty()) {
             return ScanResult(
                 error = "Tidak ada kontak WhatsApp yang terdeteksi. Pastikan WhatsApp terpasang, " +
@@ -180,7 +272,7 @@ class MainActivity : Activity() {
             )
         }
 
-        // 2. Ambil satu nomor telepon per kontak untuk ditampilkan.
+        // 2. Satu nomor telepon per kontak untuk ditampilkan.
         val phones = HashMap<Long, String>()
         contentResolver.query(
             ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
@@ -204,7 +296,8 @@ class MainActivity : Activity() {
             arrayOf(
                 ContactsContract.Contacts._ID,
                 ContactsContract.Contacts.LOOKUP_KEY,
-                ContactsContract.Contacts.DISPLAY_NAME_PRIMARY
+                ContactsContract.Contacts.DISPLAY_NAME_PRIMARY,
+                ContactsContract.Contacts.STARRED
             ),
             null, null,
             "${ContactsContract.Contacts.DISPLAY_NAME_PRIMARY} COLLATE NOCASE ASC"
@@ -219,31 +312,38 @@ class MainActivity : Activity() {
                         id = id,
                         lookupKey = lookup,
                         name = c.getString(2) ?: "(tanpa nama)",
-                        phone = phones[id] ?: "(tanpa nomor)"
+                        phone = phones[id] ?: "(tanpa nomor)",
+                        accounts = accounts[id]?.joinToString(", ") ?: "?",
+                        starred = c.getInt(3) == 1
                     )
                 )
             }
         }
-        return ScanResult(items = found, total = total)
+        return ScanResult(items = found, total = total, waLinked = total - found.size)
     }
 
     private fun showItems(newItems: List<ContactItem>) {
         items.clear()
         items.addAll(newItems)
-        val labels = items.map { "${it.name}\n${it.phone}" }
+        val labels = items.map {
+            (if (it.starred) "★ " else "") + "${it.name}\n${it.phone}  •  ${it.accounts}"
+        }
         list.adapter = ArrayAdapter(
             this,
             android.R.layout.simple_list_item_multiple_choice,
             labels
         )
-        selectAllButton.isEnabled = items.isNotEmpty()
         selectAllButton.text = "Pilih semua"
+        selectAllButton.isEnabled = items.isNotEmpty() && !suspicious && !busy
         updateDeleteButton()
     }
 
     private fun toggleSelectAll() {
         val selectAll = selectAllButton.text == "Pilih semua"
-        for (i in 0 until list.count) list.setItemChecked(i, selectAll)
+        for (i in items.indices) {
+            // Kontak berbintang (favorit) tidak ikut dipilih otomatis.
+            list.setItemChecked(i, selectAll && !items[i].starred)
+        }
         selectAllButton.text = if (selectAll) "Batal pilih" else "Pilih semua"
         updateDeleteButton()
     }
@@ -262,67 +362,175 @@ class MainActivity : Activity() {
 
     private fun updateDeleteButton() {
         val n = selectedItems().size
-        deleteButton.isEnabled = n > 0
+        deleteButton.isEnabled = n > 0 && !busy
         deleteButton.text = if (n > 0) "Hapus ($n)" else "Hapus"
     }
 
-    // ---------- Backup dan penghapusan ----------
+    // ---------- Hapus (pelan-pelan, dengan backup) ----------
+
+    private fun batteryOk(): Boolean {
+        val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+        val level = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        return bm.isCharging || level < 0 || level >= MIN_BATTERY_PERCENT
+    }
 
     private fun confirmDelete() {
+        if (busy) return
         val selected = selectedItems()
         if (selected.isEmpty()) return
-        AlertDialog.Builder(this)
-            .setTitle("Hapus ${selected.size} kontak?")
-            .setMessage(
-                "Aplikasi akan menyimpan backup (.vcf) ke folder Download terlebih dahulu, " +
-                        "lalu menghapus kontak yang dipilih dari ponsel."
+
+        if (!batteryOk()) {
+            status.text = "Baterai di bawah $MIN_BATTERY_PERCENT% dan tidak sedang diisi. " +
+                    "Isi daya dulu, lalu coba lagi."
+            return
+        }
+
+        val round = selected.take(MAX_PER_ROUND)
+        val starred = round.count { it.starred }
+        val message = buildString {
+            append("Putaran ini: ${round.size} kontak")
+            if (selected.size > round.size) {
+                append(" (dari ${selected.size} terpilih; sisanya dihapus di putaran berikutnya)")
+            }
+            append(".\n\n")
+            append(round.take(5).joinToString("\n") { "• ${it.name}" })
+            if (round.size > 5) append("\n• ...dan ${round.size - 5} lainnya")
+            if (starred > 0) {
+                append("\n\nPerhatian: $starred kontak berbintang (favorit) ikut terpilih.")
+            }
+            append(
+                "\n\nBackup .vcf disimpan ke folder Download lebih dulu. Penghapusan " +
+                        "berjalan pelan-pelan dan bisa dibatalkan."
             )
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Hapus ${round.size} kontak?")
+            .setMessage(message)
             .setNegativeButton("Batal", null)
-            .setPositiveButton("Backup dan hapus") { _, _ -> backupAndDelete(selected) }
+            .setPositiveButton("Backup dan hapus") { _, _ -> startDelete(round) }
             .show()
     }
 
-    private fun backupAndDelete(selected: List<ContactItem>) {
-        scanButton.isEnabled = false
-        deleteButton.isEnabled = false
+    private fun startDelete(round: List<ContactItem>) {
+        if (busy) return
+        cancelled = false
+        setBusy(true, deleting = true)
         status.text = "Menyimpan backup..."
         executor.execute {
             val backupName = try {
-                backupToDownloads(selected)
+                backupToDownloads(round)
             } catch (e: Exception) {
                 null
             }
 
             if (backupName == null) {
-                runOnUiThread {
-                    scanButton.isEnabled = true
-                    updateDeleteButton()
+                ui {
+                    setBusy(false)
                     status.text = "Backup gagal, penghapusan dibatalkan. Tidak ada kontak yang dihapus."
                 }
                 return@execute
             }
 
-            var deleted = 0
-            var failed = 0
-            for (item in selected) {
-                try {
-                    val uri = ContentUris.withAppendedId(ContactsContract.Contacts.CONTENT_URI, item.id)
-                    if (contentResolver.delete(uri, null, null) > 0) deleted++ else failed++
-                } catch (e: Exception) {
-                    failed++
-                }
+            val report = deleteInBatches(round) { done, total ->
+                ui { status.text = "Menghapus $done dari $total... (jangan tutup aplikasi)" }
             }
-
-            runOnUiThread {
-                scanButton.isEnabled = true
-                status.text = "Selesai: $deleted kontak dihapus, $failed gagal.\n" +
-                        "Backup: Download/$backupName"
-                scan()
-            }
+            ui { finishDelete(report, backupName) }
         }
     }
 
-    /** Menyimpan kontak terpilih ke satu file .vcf di folder Download. Mengembalikan nama file, atau null jika gagal. */
+    private fun contactUri(id: Long): Uri =
+        ContentUris.withAppendedId(ContactsContract.Contacts.CONTENT_URI, id)
+
+    /**
+     * Menghapus per kelompok kecil dengan jeda, supaya sistem kontak dan sinkronisasi
+     * tidak kewalahan. Jika satu kelompok ditolak, kontaknya dicoba satu per satu agar
+     * penyebabnya jelas.
+     */
+    private fun deleteInBatches(
+        round: List<ContactItem>,
+        onProgress: (Int, Int) -> Unit
+    ): DeleteReport {
+        val deleted = mutableListOf<ContactItem>()
+        val failed = mutableListOf<Pair<ContactItem, String>>()
+        var processed = 0
+
+        for (chunk in round.chunked(BATCH_SIZE)) {
+            if (cancelled) break
+
+            val ops = ArrayList<ContentProviderOperation>()
+            for (item in chunk) {
+                ops.add(ContentProviderOperation.newDelete(contactUri(item.id)).build())
+            }
+
+            var batchOk = false
+            try {
+                val results = contentResolver.applyBatch(ContactsContract.AUTHORITY, ops)
+                for (i in chunk.indices) {
+                    val count = results.getOrNull(i)?.count ?: 0
+                    if (count > 0) {
+                        deleted.add(chunk[i])
+                    } else {
+                        failed.add(chunk[i] to "ditolak sistem (akun mungkin hanya-baca)")
+                    }
+                }
+                batchOk = true
+            } catch (e: Exception) {
+                // Satu kelompok gagal: coba satu per satu di bawah.
+            }
+
+            if (!batchOk) {
+                for (item in chunk) {
+                    if (cancelled) break
+                    try {
+                        val n = contentResolver.delete(contactUri(item.id), null, null)
+                        if (n > 0) {
+                            deleted.add(item)
+                        } else {
+                            failed.add(item to "ditolak sistem (akun mungkin hanya-baca)")
+                        }
+                    } catch (e: Exception) {
+                        failed.add(item to (e.message ?: e.javaClass.simpleName))
+                    }
+                    Thread.sleep(INDIVIDUAL_PAUSE_MS)
+                }
+            }
+
+            processed += chunk.size
+            onProgress(processed, round.size)
+            Thread.sleep(BATCH_PAUSE_MS)
+        }
+        return DeleteReport(deleted, failed, cancelled)
+    }
+
+    private fun finishDelete(report: DeleteReport, backupName: String) {
+        val deletedIds = report.deleted.map { it.id }.toSet()
+        // Perbarui daftar dari memori; tidak memindai ulang agar tidak membebani sistem.
+        val remaining = items.filter { it.id !in deletedIds }
+        showItems(remaining)
+        setBusy(false)
+
+        status.text = buildString {
+            append("Selesai: ${report.deleted.size} kontak dihapus, ${report.failed.size} gagal")
+            if (report.cancelled) append(" (dibatalkan)")
+            append(".\nBackup: Download/$backupName")
+            append("\nTekan \"Pindai kontak\" untuk menyegarkan daftar.")
+        }
+
+        if (report.failed.isNotEmpty()) {
+            val detail = report.failed.take(15).joinToString("\n\n") { (item, reason) ->
+                "${item.name}\nAkun: ${item.accounts}\nAlasan: $reason"
+            }
+            val more = if (report.failed.size > 15) "\n\n...dan ${report.failed.size - 15} lainnya." else ""
+            AlertDialog.Builder(this)
+                .setTitle("${report.failed.size} kontak tidak bisa dihapus")
+                .setMessage(detail + more)
+                .setPositiveButton("OK", null)
+                .show()
+        }
+    }
+
+    /** Menyimpan kontak yang akan dihapus ke satu file .vcf di folder Download. Mengembalikan nama file, atau null jika gagal. */
     private fun backupToDownloads(selected: List<ContactItem>): String? {
         val fileName = "backup_kontak_${System.currentTimeMillis()}.vcf"
         val values = ContentValues().apply {
@@ -334,7 +542,12 @@ class MainActivity : Activity() {
             ?: return null
 
         var written = 0
-        contentResolver.openOutputStream(target)?.use { out ->
+        val stream = contentResolver.openOutputStream(target)
+        if (stream == null) {
+            contentResolver.delete(target, null, null)
+            return null
+        }
+        stream.use { out ->
             for (item in selected) {
                 val vcardUri = Uri.withAppendedPath(
                     ContactsContract.Contacts.CONTENT_VCARD_URI,
@@ -346,7 +559,7 @@ class MainActivity : Activity() {
                     written++
                 }
             }
-        } ?: return null
+        }
 
         // Backup harus mencakup semua kontak yang akan dihapus; jika ada yang gagal, batalkan.
         if (written != selected.size) {
@@ -358,5 +571,10 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQ_PERMS = 100
+        private const val MAX_PER_ROUND = 100
+        private const val BATCH_SIZE = 20
+        private const val BATCH_PAUSE_MS = 600L
+        private const val INDIVIDUAL_PAUSE_MS = 200L
+        private const val MIN_BATTERY_PERCENT = 20
     }
 }

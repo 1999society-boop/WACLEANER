@@ -22,18 +22,19 @@ dan tidak memakai library tidak resmi, jadi tidak ada risiko akun WhatsApp diblo
 
 ## Pengaman
 
-- Penghapusan berjalan per kelompok kecil (20 kontak) dengan jeda, maksimal 100 kontak per
-  putaran, supaya sistem kontak dan sinkronisasi tidak kewalahan. Bisa dibatalkan kapan saja.
+- Penghapusan berjalan per kelompok kecil (20 kontak) dengan jeda, ditambah istirahat 3 detik
+  tiap 200 kontak, supaya sistem kontak dan sinkronisasi tidak kewalahan. Penghapusan 200 kontak
+  atau lebih meminta konfirmasi kedua. Bisa dibatalkan kapan saja.
 - Layar dijaga tetap menyala selama penghapusan, dan penghapusan ditolak jika baterai di bawah 20%
   dan tidak sedang diisi.
 - Kontak berbintang (favorit) ditandai ★ dan tidak ikut dipilih oleh "Pilih semua".
-- Jika hampir semua kontak terdeteksi tidak terhubung (kemungkinan sinkronisasi WhatsApp belum
-  selesai), "Pilih semua" dimatikan dan muncul peringatan.
+- Jika hampir semua kontak terdeteksi tidak terhubung (mungkin sinkronisasi WhatsApp belum
+  selesai), muncul peringatan dan konfirmasi kedua sebelum menghapus.
 - Setiap kontak menampilkan akunnya (Google, Lokal, SIM, dst.). Kontak yang gagal dihapus
   dilaporkan lengkap dengan akun dan alasannya.
 
-- Sebelum menghapus, aplikasi menyimpan backup `.vcf` ke folder **Download**. Jika backup gagal,
-  tidak ada kontak yang dihapus.
+- Sebelum menghapus, aplikasi menyimpan backup `.vcf` ke folder **Download**. Kontak yang gagal
+  masuk backup dilewati dan tidak dihapus.
 - Hanya kontak yang kamu centang yang dihapus. Tidak ada penghapusan otomatis.
 - Jika tidak ada satu pun kontak WhatsApp yang terdeteksi (WhatsApp belum terpasang, belum login,
   atau sinkronisasi kontak mati), pemindaian dibatalkan agar semua kontak tidak ikut terdaftar

@@ -46,6 +46,11 @@ class DeleteReport(
     val cancelled: Boolean
 )
 
+class BackupResult(
+    val fileName: String,
+    val saved: List<ContactItem>
+)
+
 class MainActivity : Activity() {
 
     private val executor = Executors.newSingleThreadExecutor()
@@ -55,6 +60,7 @@ class MainActivity : Activity() {
     private var cancelled = false
     private var busy = false
     private var suspicious = false
+    private var lastTotal = 0
 
     private lateinit var status: TextView
     private lateinit var list: ListView
@@ -199,7 +205,7 @@ class MainActivity : Activity() {
     private fun setBusy(value: Boolean, deleting: Boolean = false) {
         busy = value
         scanButton.isEnabled = !value
-        selectAllButton.isEnabled = !value && items.isNotEmpty() && !suspicious
+        selectAllButton.isEnabled = !value && items.isNotEmpty()
         list.isEnabled = !value
         cancelButton.visibility = if (value && deleting) View.VISIBLE else View.GONE
         if (value) {
@@ -261,6 +267,7 @@ class MainActivity : Activity() {
                     status.text = result.error
                 } else {
                     suspicious = result.total > 20 && result.items.size * 10 > result.total * 9
+                    lastTotal = result.total
                     showItems(result.items)
                     setBusy(false)
                     status.text = buildString {
@@ -268,9 +275,10 @@ class MainActivity : Activity() {
                         append("${result.items.size} tidak terhubung.")
                         if (suspicious) {
                             append(
-                                "\nPERINGATAN: hampir semua kontak terdeteksi tidak terhubung. " +
-                                        "Kemungkinan sinkronisasi kontak WhatsApp belum selesai. " +
-                                        "\"Pilih semua\" dimatikan; periksa dulu dan centang satu per satu."
+                                "\nPerhatian: lebih dari 90% kontak terdeteksi tidak terhubung. " +
+                                        "Itu wajar jika memang kebanyakan kontakmu bukan pengguna WhatsApp. " +
+                                        "Jika tidak, pastikan sinkronisasi kontak WhatsApp sudah selesai " +
+                                        "sebelum menghapus. Centang yang ingin dihapus."
                             )
                         } else if (result.items.isNotEmpty()) {
                             append(" Centang yang ingin dihapus.")
@@ -388,7 +396,7 @@ class MainActivity : Activity() {
             labels
         )
         selectAllButton.text = "Pilih semua"
-        selectAllButton.isEnabled = items.isNotEmpty() && !suspicious && !busy
+        selectAllButton.isEnabled = items.isNotEmpty() && !busy
         updateDeleteButton()
     }
 
@@ -439,14 +447,10 @@ class MainActivity : Activity() {
             return
         }
 
-        val round = selected.take(MAX_PER_ROUND)
+        val round = selected
         val starred = round.count { it.starred }
         val message = buildString {
-            append("Putaran ini: ${round.size} kontak")
-            if (selected.size > round.size) {
-                append(" (dari ${selected.size} terpilih; sisanya dihapus di putaran berikutnya)")
-            }
-            append(".\n\n")
+            append("Kontak yang akan dihapus: ${round.size}.\n\n")
             append(round.take(5).joinToString("\n") { "• ${it.name}" })
             if (round.size > 5) append("\n• ...dan ${round.size - 5} lainnya")
             if (starred > 0) {
@@ -462,7 +466,28 @@ class MainActivity : Activity() {
             .setTitle("Hapus ${round.size} kontak?")
             .setMessage(message)
             .setNegativeButton("Batal", null)
-            .setPositiveButton("Backup dan hapus") { _, _ -> startDelete(round) }
+            .setPositiveButton("Backup dan hapus") { _, _ -> confirmLarge(round) }
+            .show()
+            .window?.decorView?.filterTouchesWhenObscured = true
+    }
+
+    /** Konfirmasi kedua untuk penghapusan besar, atau saat hampir semua kontak ikut terhapus. */
+    private fun confirmLarge(round: List<ContactItem>) {
+        if (round.size < LARGE_DELETE_THRESHOLD && !suspicious) {
+            startDelete(round)
+            return
+        }
+        val percent = if (lastTotal > 0) round.size * 100 / lastTotal else 0
+        AlertDialog.Builder(this)
+            .setTitle("Yakin menghapus ${round.size} kontak?")
+            .setMessage(
+                "Ini ${round.size} dari $lastTotal kontak di HP-mu (sekitar $percent%).\n\n" +
+                        "Backup .vcf dibuat dulu. Untuk jumlah sebesar ini prosesnya bisa " +
+                        "memakan beberapa menit: biarkan layar menyala dan HP diisi daya. " +
+                        "Kamu bisa membatalkan kapan saja."
+            )
+            .setNegativeButton("Batal", null)
+            .setPositiveButton("Ya, hapus ${round.size}") { _, _ -> startDelete(round) }
             .show()
             .window?.decorView?.filterTouchesWhenObscured = true
     }
@@ -473,13 +498,15 @@ class MainActivity : Activity() {
         setBusy(true, deleting = true)
         status.text = "Menyimpan backup..."
         executor.execute {
-            val backupName = try {
-                backupToDownloads(round)
+            val backup = try {
+                backupToDownloads(round) { done, total ->
+                    ui { status.text = "Menyimpan backup... $done dari $total" }
+                }
             } catch (e: Exception) {
                 null
             }
 
-            if (backupName == null) {
+            if (backup == null || backup.saved.isEmpty()) {
                 ui {
                     setBusy(false)
                     status.text = "Backup gagal, penghapusan dibatalkan. Tidak ada kontak yang dihapus."
@@ -487,10 +514,20 @@ class MainActivity : Activity() {
                 return@execute
             }
 
-            val report = deleteInBatches(round) { done, total ->
+            if (cancelled) {
+                ui {
+                    setBusy(false)
+                    status.text = "Dibatalkan. Tidak ada kontak yang dihapus."
+                }
+                return@execute
+            }
+
+            // Hanya kontak yang berhasil masuk backup yang boleh dihapus.
+            val skipped = round.size - backup.saved.size
+            val report = deleteInBatches(backup.saved) { done, total ->
                 ui { status.text = "Menghapus $done dari $total... (jangan tutup aplikasi)" }
             }
-            ui { finishDelete(report, backupName) }
+            ui { finishDelete(report, backup.fileName, skipped) }
         }
     }
 
@@ -509,6 +546,7 @@ class MainActivity : Activity() {
         val deleted = mutableListOf<ContactItem>()
         val failed = mutableListOf<Pair<ContactItem, String>>()
         var processed = 0
+        var sinceCooldown = 0
 
         for (chunk in round.chunked(BATCH_SIZE)) {
             if (cancelled) break
@@ -554,11 +592,22 @@ class MainActivity : Activity() {
             processed += chunk.size
             onProgress(processed, round.size)
             Thread.sleep(BATCH_PAUSE_MS)
+
+            sinceCooldown += chunk.size
+            if (sinceCooldown >= COOLDOWN_EVERY) {
+                sinceCooldown = 0
+                // Istirahat singkat supaya sinkronisasi kontak sempat menyusul.
+                var waited = 0L
+                while (waited < COOLDOWN_MS && !cancelled) {
+                    Thread.sleep(500)
+                    waited += 500
+                }
+            }
         }
         return DeleteReport(deleted, failed, cancelled)
     }
 
-    private fun finishDelete(report: DeleteReport, backupName: String) {
+    private fun finishDelete(report: DeleteReport, backupName: String, skipped: Int) {
         val deletedIds = report.deleted.map { it.id }.toSet()
         // Perbarui daftar dari memori; tidak memindai ulang agar tidak membebani sistem.
         val remaining = items.filter { it.id !in deletedIds }
@@ -567,10 +616,12 @@ class MainActivity : Activity() {
 
         status.text = buildString {
             append("Selesai: ${report.deleted.size} kontak dihapus, ${report.failed.size} gagal")
+            if (skipped > 0) append(", $skipped dilewati karena gagal masuk backup")
             if (report.cancelled) append(" (dibatalkan)")
             append(".\nBackup: Download/$backupName")
             append("\n(Isinya data kontak tanpa enkripsi; hapus file ini setelah yakin semuanya aman.)")
             append("\nTekan \"Pindai kontak\" untuk menyegarkan daftar.")
+            append("\nDi WhatsApp, buka menu titik tiga lalu \"Segarkan\" agar daftar kontak di WhatsApp ikut diperbarui.")
         }
 
         if (report.failed.isNotEmpty()) {
@@ -587,7 +638,10 @@ class MainActivity : Activity() {
     }
 
     /** Menyimpan kontak yang akan dihapus ke satu file .vcf di folder Download. Mengembalikan nama file, atau null jika gagal. */
-    private fun backupToDownloads(selected: List<ContactItem>): String? {
+    private fun backupToDownloads(
+        selected: List<ContactItem>,
+        onProgress: (Int, Int) -> Unit
+    ): BackupResult? {
         val fileName = "backup_kontak_${System.currentTimeMillis()}.vcf"
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, fileName)
@@ -597,37 +651,45 @@ class MainActivity : Activity() {
         val target = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
             ?: return null
 
-        var written = 0
+        val saved = mutableListOf<ContactItem>()
         val stream = contentResolver.openOutputStream(target)
         if (stream == null) {
             contentResolver.delete(target, null, null)
             return null
         }
         stream.use { out ->
-            for (item in selected) {
-                val vcardUri = Uri.withAppendedPath(
-                    ContactsContract.Contacts.CONTENT_VCARD_URI,
-                    item.lookupKey
-                )
-                contentResolver.openInputStream(vcardUri)?.use { input ->
-                    input.copyTo(out)
-                    out.write("\r\n".toByteArray())
-                    written++
+            for ((index, item) in selected.withIndex()) {
+                if (cancelled) break
+                try {
+                    val vcardUri = Uri.withAppendedPath(
+                        ContactsContract.Contacts.CONTENT_VCARD_URI,
+                        item.lookupKey
+                    )
+                    val input = contentResolver.openInputStream(vcardUri)
+                    if (input != null) {
+                        input.use { it.copyTo(out) }
+                        out.write("\r\n".toByteArray())
+                        saved.add(item)
+                    }
+                } catch (e: Exception) {
+                    // Kontak ini tidak masuk backup, jadi tidak akan dihapus.
                 }
+                if ((index + 1) % 25 == 0) onProgress(index + 1, selected.size)
             }
         }
 
-        // Backup harus mencakup semua kontak yang akan dihapus; jika ada yang gagal, batalkan.
-        if (written != selected.size) {
+        if (saved.isEmpty()) {
             contentResolver.delete(target, null, null)
             return null
         }
-        return fileName
+        return BackupResult(fileName, saved)
     }
 
     companion object {
         private const val REQ_PERMS = 100
-        private const val MAX_PER_ROUND = 100
+        private const val LARGE_DELETE_THRESHOLD = 200
+        private const val COOLDOWN_EVERY = 200
+        private const val COOLDOWN_MS = 3000L
         private const val BATCH_SIZE = 20
         private const val BATCH_PAUSE_MS = 600L
         private const val INDIVIDUAL_PAUSE_MS = 200L

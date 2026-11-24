@@ -133,7 +133,61 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         )
 
+        val infoButton = Button(this).apply {
+            text = "Info keamanan"
+            setOnClickListener { showSecurityInfo() }
+        }
+        root.addView(infoButton)
+
+        // Anti-tapjacking: abaikan sentuhan jika ada jendela aplikasi lain yang menimpa layar.
+        root.filterTouchesWhenObscured = true
+
         setContentView(root)
+    }
+
+    /** Menampilkan fakta keamanan yang dibaca langsung dari aplikasi yang sedang berjalan. */
+    @Suppress("DEPRECATION")
+    private fun showSecurityInfo() {
+        val message = try {
+            val info = packageManager.getPackageInfo(
+                packageName,
+                PackageManager.GET_PERMISSIONS or PackageManager.GET_SIGNING_CERTIFICATES
+            )
+            val perms = info.requestedPermissions?.toList() ?: emptyList()
+            val hasInternet = perms.contains(Manifest.permission.INTERNET)
+            val signer = info.signingInfo?.apkContentsSigners?.firstOrNull()
+            val fingerprint = if (signer == null) {
+                "tidak diketahui"
+            } else {
+                java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(signer.toByteArray())
+                    .joinToString(":") { b -> "%02X".format(b) }
+            }
+            val debuggable =
+                (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
+            buildString {
+                append("Izin yang diminta aplikasi ini:\n")
+                if (perms.isEmpty()) append("• (tidak ada)\n")
+                perms.forEach { append("• ${it.substringAfterLast('.')}\n") }
+                append("\nAkses internet: ${if (hasInternet) "ADA" else "tidak ada"}")
+                append("\nMode debug: ${if (debuggable) "AKTIF" else "mati"}")
+                append("\nLibrary pihak ketiga: tidak ada")
+                append("\nPemrosesan: seluruhnya di HP ini; kontakmu tidak dikirim ke mana pun.")
+                append("\n\nSHA-256 sertifikat penandatangan:\n$fingerprint")
+                append("\n\nBandingkan dengan nilai di halaman rilis GitHub. Jika berbeda, ")
+                append("aplikasi ini bukan dari rilis resmi: jangan dipakai.")
+            }
+        } catch (e: Exception) {
+            "Gagal membaca info keamanan: ${e.message}"
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Info keamanan")
+            .setMessage(message)
+            .setPositiveButton("OK", null)
+            .show()
+            .window?.decorView?.filterTouchesWhenObscured = true
     }
 
     private fun ui(block: () -> Unit) {
@@ -410,6 +464,7 @@ class MainActivity : Activity() {
             .setNegativeButton("Batal", null)
             .setPositiveButton("Backup dan hapus") { _, _ -> startDelete(round) }
             .show()
+            .window?.decorView?.filterTouchesWhenObscured = true
     }
 
     private fun startDelete(round: List<ContactItem>) {
@@ -514,6 +569,7 @@ class MainActivity : Activity() {
             append("Selesai: ${report.deleted.size} kontak dihapus, ${report.failed.size} gagal")
             if (report.cancelled) append(" (dibatalkan)")
             append(".\nBackup: Download/$backupName")
+            append("\n(Isinya data kontak tanpa enkripsi; hapus file ini setelah yakin semuanya aman.)")
             append("\nTekan \"Pindai kontak\" untuk menyegarkan daftar.")
         }
 

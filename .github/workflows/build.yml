@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-java@v5
         with:
@@ -26,15 +28,77 @@ jobs:
         with:
           gradle-version: "8.7"
 
-      - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
+      # Kunci tanda tangan hanya ada di langkah ini dan dihapus saat langkah selesai.
+      # Jika secret KEYSTORE_B64 diisi pemilik repo, kunci tetap dipakai; jika belum,
+      # dibuat kunci sementara khusus build ini.
+      - name: Build signed release APK
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          STORED_STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          STORED_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+          STORED_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          export KEYSTORE_PATH="$RUNNER_TEMP/release.jks"
+          trap 'rm -f "$KEYSTORE_PATH"' EXIT
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$KEYSTORE_PATH"
+            export KEYSTORE_PASSWORD="$STORED_STORE_PASS" KEY_PASSWORD="$STORED_KEY_PASS" KEY_ALIAS="$STORED_ALIAS"
+            echo "SIGNING_MODE=tetap" >> "$GITHUB_ENV"
+          else
+            export KEYSTORE_PASSWORD="$(openssl rand -hex 24)"
+            export KEY_PASSWORD="$KEYSTORE_PASSWORD" KEY_ALIAS="wacleaner"
+            keytool -genkeypair -keystore "$KEYSTORE_PATH" -alias "$KEY_ALIAS" \
+              -keyalg RSA -keysize 4096 -validity 36500 \
+              -storepass "$KEYSTORE_PASSWORD" -keypass "$KEY_PASSWORD" \
+              -dname "CN=WA Contact Cleaner, O=WaCleaner" > /dev/null 2>&1
+            echo "SIGNING_MODE=sementara" >> "$GITHUB_ENV"
+          fi
+          gradle assembleRelease --no-daemon
 
-      - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk WaCleaner.apk
+      - name: Verify and publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          APK=app/build/outputs/apk/release/app-release.apk
+          test -f "$APK"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
 
-      - name: Publish release with APK
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: WA Contact Cleaner build ${{ github.run_number }}
-          files: WaCleaner.apk
+          echo "Izin yang diminta APK:"
+          "$BT/aapt2" dump permissions "$APK" | grep '^uses-permission' | tee perms.txt
+          for p in $(grep -o "name='[^']*'" perms.txt | sed "s/name='//; s/'//"); do
+            case "$p" in
+              android.permission.READ_CONTACTS|android.permission.WRITE_CONTACTS) ;;
+              *.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION) ;;
+              *) echo "::error::Izin tak terduga di APK: $p"; exit 1 ;;
+            esac
+          done
+
+          if "$BT/aapt2" dump badging "$APK" | grep -q "application-debuggable"; then
+            echo "::error::APK masih debuggable"; exit 1
+          fi
+
+          "$BT/apksigner" verify --print-certs "$APK" > certs.txt
+          cat certs.txt
+          CERT=$(grep -m1 'certificate SHA-256 digest' certs.txt | awk '{print $NF}' | tr a-f A-F | sed 's/../&:/g; s/:$//')
+          cp "$APK" WaCleaner.apk
+          SHA=$(sha256sum WaCleaner.apk | cut -d' ' -f1)
+
+          {
+            printf 'Izin aplikasi (diperiksa otomatis di setiap build): hanya READ_CONTACTS dan WRITE_CONTACTS. Tidak ada izin internet.\n\n'
+            printf 'SHA-256 file APK: `%s`\n\n' "$SHA"
+            printf 'SHA-256 sertifikat penandatangan: `%s`\n\n' "$CERT"
+            printf 'Bandingkan sertifikat di atas dengan menu "Info keamanan" di dalam aplikasi.\n\n'
+            if [ "$SIGNING_MODE" = "sementara" ]; then
+              printf 'Mode kunci: sementara. Sertifikat berbeda di setiap build, jadi copot versi lama sebelum memasang versi baru.\n'
+            else
+              printf 'Mode kunci: tetap. Sertifikat sama di setiap build, jadi bisa memperbarui tanpa mencopot.\n'
+            fi
+          } > notes.md
+
+          gh release create "build-${{ github.run_number }}" WaCleaner.apk \
+            --target "$GITHUB_SHA" \
+            --title "WA Contact Cleaner build ${{ github.run_number }}" \
+            --notes-file notes.md

@@ -41,6 +41,25 @@ dan tidak memakai library tidak resmi, jadi tidak ada risiko akun WhatsApp diblo
 - Kontak yang digabung dengan kontak WhatsApp (aggregated contact) dianggap terhubung dan tidak
   ditampilkan.
 
+## Keamanan dan verifikasi
+
+- **Tanpa internet.** Aplikasi hanya meminta izin baca dan tulis kontak. Setiap build di GitHub
+  diperiksa otomatis: jika ada izin lain di APK (termasuk internet), build gagal dan tidak
+  dirilis. Build juga gagal jika APK masih berstatus debug.
+- **Tanpa library pihak ketiga.** Tidak ada blok `dependencies` di `app/build.gradle.kts`,
+  sehingga tidak ada kode luar yang bisa membawa celah.
+- **Build rilis**, bukan debug, dengan R8 (pengecilan kode) menyala dan `allowBackup` mati.
+- **Anti-tapjacking.** Layar utama dan dialog konfirmasi mengabaikan sentuhan jika ada
+  aplikasi lain yang menimpa layar.
+- **Menu "Info keamanan"** di aplikasi membaca langsung izin, status debug, dan SHA-256
+  sertifikat penandatangan. Bandingkan dengan nilai di catatan rilis GitHub; jika berbeda,
+  jangan pakai APK itu.
+- **Unduh hanya dari halaman Releases repository ini.** Jangan pasang salinan APK dari sumber lain.
+- Pipeline build memakai tanda tangan dari secret `KEYSTORE_B64`, `KEYSTORE_PASSWORD`,
+  `KEY_PASSWORD`, `KEY_ALIAS` jika diisi pemilik repo (sertifikat tetap di setiap versi). Jika
+  belum diisi, dibuat kunci sementara per build; tiap versi baru harus mencopot yang lama dulu.
+  Kunci hanya ada selama langkah build dan dihapus sesudahnya.
+
 ## Batasan
 
 - Kontak di akun yang bersifat read-only (misalnya sebagian kontak SIM) mungkin gagal dihapus.
